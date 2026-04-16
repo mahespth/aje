@@ -443,3 +443,800 @@ class CursesApp:
 
         self.status_message: str = ""
         self.status_ts: float = 0.0
+
+
+        self.popup_active = False
+
+    # ---------- State / Persistence ----------
+
+    def persist(self) -> None:
+        self.store.set_resume(self.resume)
+        self.store.set_bookmarks(self.bookmarks)
+        self.store.save()
+
+    def set_status(self, message: str) -> None:
+        self.status_message = message
+        self.status_ts = now_ts()
+
+    # ---------- Loading Data ----------
+
+    def load_jobs_page(self, use_cache: bool = True, force: bool = False) -> None:
+        page_key = f"{self.resume.jobs_page}:{self.config.page_size}:{self.jobs_search_term}"
+        data = None if force else self.store.cache_get("jobs_pages", page_key, ttl=self.config.cache_ttl if use_cache else 0)
+        if data is None:
+            data = self.client.list_jobs(page=self.resume.jobs_page, page_size=self.config.page_size, search=self.jobs_search_term)
+            self.store.cache_set("jobs_pages", page_key, data)
+            for job in data.get("results", []) or []:
+                jid = job.get("id")
+                if jid is not None:
+                    self.store.cache_set("jobs", str(jid), job)
+        self.jobs_page_data = data
+        results = self.jobs_page_data.get("results", []) or []
+        if not results:
+            self.resume.jobs_cursor = 0
+        else:
+            self.resume.jobs_cursor = max(0, min(self.resume.jobs_cursor, len(results) - 1))
+        self.build_job_list_search()
+
+    def load_job(self, job_id: int, use_cache: bool = True, force: bool = False) -> None:
+        data = None if force else self.store.cache_get("jobs", str(job_id), ttl=self.config.cache_ttl if use_cache else 0)
+        if data is None:
+            data = self.client.get_job(job_id)
+            self.store.cache_set("jobs", str(job_id), data)
+        self.current_job = data
+        self.resume.selected_job_id = job_id
+        self.persist()
+
+    def load_stdout(self, use_cache: bool = True, force: bool = False) -> None:
+        if self.resume.selected_job_id is None:
+            return
+        key = str(self.resume.selected_job_id)
+        data = None if force else self.store.cache_get("job_stdout", key, ttl=self.config.cache_ttl if use_cache else 0)
+        if data is None:
+            data = self.client.get_job_stdout(self.resume.selected_job_id)
+            self.store.cache_set("job_stdout", key, data)
+        self.current_stdout = data or ""
+        if self.resume.output_search and self.resume.screen != "job":
+            self.resume.output_search = ""
+        self._rebuild_stdout_lines()
+        self.persist()
+
+    def load_events(self, use_cache: bool = True, force: bool = False) -> None:
+        if self.resume.selected_job_id is None:
+            return
+        key = str(self.resume.selected_job_id)
+        data = None if force else self.store.cache_get("job_events", key, ttl=self.config.cache_ttl if use_cache else 0)
+        if data is None:
+            data = self.client.list_all_job_events(self.resume.selected_job_id)
+            self.store.cache_set("job_events", key, data)
+        self.current_events = data or []
+        if self.current_events:
+            self.resume.event_cursor = max(0, min(self.resume.event_cursor, len(self.current_events) - 1))
+        else:
+            self.resume.event_cursor = 0
+        self.build_event_search()
+        self.persist()
+
+    def get_event_detail(self, event_id: int, use_cache: bool = True, force: bool = False) -> Dict[str, Any]:
+        key = str(event_id)
+        data = None if force else self.store.cache_get("event_details", key, ttl=self.config.cache_ttl if use_cache else 0)
+        if data is None:
+            data = self.client.get_job_event_detail(event_id)
+            self.store.cache_set("event_details", key, data)
+            self.persist()
+        return data
+
+    # ---------- Search ----------
+
+    def build_job_list_search(self) -> None:
+        term = self.jobs_search_term.strip().lower()
+        self.jobs_search_matches = []
+        if not term:
+            return
+        for idx, job in enumerate(self.jobs_page_data.get("results", []) or []):
+            blob = " ".join([
+                str(job.get("id", "")),
+                str(job.get("name", "")),
+                str(job.get("status", "")),
+                str(job.get("job_template", "")),
+                str(job.get("finished", "")),
+            ]).lower()
+            if term in blob:
+                self.jobs_search_matches.append(idx)
+
+    def build_output_search(self) -> None:
+        term = self.resume.output_search.strip().lower()
+        self.output_search_matches = []
+        if not term:
+            return
+        for idx, line in enumerate(self.current_stdout_lines):
+            if term in line.lower():
+                self.output_search_matches.append(idx)
+
+    def build_event_search(self) -> None:
+        term = self.resume.event_search.strip().lower()
+        self.event_search_matches = []
+        if not term:
+            return
+        for idx, event in enumerate(self.current_events):
+            blob = " ".join([
+                str(event.get("event", "")),
+                str(event.get("event_display", "")),
+                str(event.get("failed", "")),
+                str(event.get("changed", "")),
+                str(event.get("host_name", "")),
+                str(event.get("play", "")),
+                str(event.get("task", "")),
+                str(event.get("role", "")),
+                str(event.get("stdout", "")),
+                str(event.get("start_line", "")),
+                str(event.get("end_line", "")),
+            ]).lower()
+            if term in blob:
+                self.event_search_matches.append(idx)
+        if self.event_search_matches:
+            self.resume.event_cursor = self.event_search_matches[0]
+            self.ensure_event_cursor_visible()
+
+    # ---------- Helpers ----------
+
+    def _rebuild_stdout_lines(self) -> None:
+        h, w = self.stdscr.getmaxyx()
+        usable_width = max(20, w - 2)
+        self.current_stdout_lines = wrapped_lines(self.current_stdout, usable_width)
+        self.build_output_search()
+        max_scroll = max(0, len(self.current_stdout_lines) - max(1, h - 2))
+        self.resume.output_scroll = max(0, min(self.resume.output_scroll, max_scroll))
+
+    def selected_job_from_list(self) -> Optional[Dict[str, Any]]:
+        results = self.jobs_page_data.get("results", []) or []
+        if not results:
+            return None
+        if self.resume.jobs_cursor < 0 or self.resume.jobs_cursor >= len(results):
+            return None
+        return results[self.resume.jobs_cursor]
+
+    def selected_event(self) -> Optional[Dict[str, Any]]:
+        if not self.current_events:
+            return None
+        idx = self.resume.event_cursor
+        if idx < 0 or idx >= len(self.current_events):
+            return None
+        return self.current_events[idx]
+
+    def ensure_event_cursor_visible(self) -> None:
+        h, _ = self.stdscr.getmaxyx()
+        view_h = max(3, h - 4)
+        if self.resume.event_cursor < self.resume.event_scroll:
+            self.resume.event_scroll = self.resume.event_cursor
+        elif self.resume.event_cursor >= self.resume.event_scroll + view_h:
+            self.resume.event_scroll = self.resume.event_cursor - view_h + 1
+
+    def goto_next_output_match(self, reverse: bool = False) -> None:
+        if not self.output_search_matches:
+            self.set_status("No output search matches")
+            return
+        cur = self.resume.output_scroll
+        matches = list(reversed(self.output_search_matches)) if reverse else self.output_search_matches
+        for line_idx in matches:
+            if reverse:
+                if line_idx < cur:
+                    self.resume.output_scroll = line_idx
+                    return
+            else:
+                if line_idx > cur:
+                    self.resume.output_scroll = line_idx
+                    return
+        self.resume.output_scroll = matches[0]
+        self.set_status("Wrapped search")
+
+    def goto_next_job_match(self, reverse: bool = False) -> None:
+        if not self.jobs_search_matches:
+            self.set_status("No visible job matches")
+            return
+        cur = self.resume.jobs_cursor
+        matches = list(reversed(self.jobs_search_matches)) if reverse else self.jobs_search_matches
+        for idx in matches:
+            if reverse:
+                if idx < cur:
+                    self.resume.jobs_cursor = idx
+                    return
+            else:
+                if idx > cur:
+                    self.resume.jobs_cursor = idx
+                    return
+        self.resume.jobs_cursor = matches[0]
+        self.set_status("Wrapped search")
+
+    def goto_next_event_match(self, reverse: bool = False) -> None:
+        if not self.event_search_matches:
+            self.set_status("No event matches")
+            return
+        cur = self.resume.event_cursor
+        matches = list(reversed(self.event_search_matches)) if reverse else self.event_search_matches
+        for idx in matches:
+            if reverse:
+                if idx < cur:
+                    self.resume.event_cursor = idx
+                    self.ensure_event_cursor_visible()
+                    return
+            else:
+                if idx > cur:
+                    self.resume.event_cursor = idx
+                    self.ensure_event_cursor_visible()
+                    return
+        self.resume.event_cursor = matches[0]
+        self.ensure_event_cursor_visible()
+        self.set_status("Wrapped search")
+
+    def add_bookmark(self) -> None:
+        if self.resume.selected_job_id is None:
+            self.set_status("No active job to bookmark")
+            return
+        note = ""
+        if self.resume.screen == "job":
+            note = f"job:{self.resume.selected_job_id}:scroll:{self.resume.output_scroll}"
+            bm = Bookmark(
+                job_id=self.resume.selected_job_id,
+                view="job",
+                cursor=0,
+                scroll=self.resume.output_scroll,
+                note=note,
+            )
+        elif self.resume.screen == "events":
+            event = self.selected_event()
+            note = f"job:{self.resume.selected_job_id}:event:{event.get('id') if event else 'na'}"
+            bm = Bookmark(
+                job_id=self.resume.selected_job_id,
+                view="events",
+                cursor=self.resume.event_cursor,
+                scroll=self.resume.event_scroll,
+                note=note,
+            )
+        else:
+            self.set_status("Bookmarking is only available in job output or events view")
+            return
+
+        self.bookmarks.append(bm)
+        self.resume.bookmark_index = len(self.bookmarks) - 1
+        self.persist()
+        self.set_status(f"Bookmarked {note}")
+
+    def jump_bookmark(self) -> None:
+        if not self.bookmarks:
+            self.set_status("No bookmarks saved")
+            return
+        next_idx = (self.resume.bookmark_index + 1) % len(self.bookmarks)
+        bm = self.bookmarks[next_idx]
+        self.resume.bookmark_index = next_idx
+        self.resume.selected_job_id = bm.job_id
+        self.load_job(bm.job_id)
+        self.load_stdout()
+        if bm.view == "events":
+            self.load_events()
+            self.resume.screen = "events"
+            self.resume.event_cursor = max(0, min(bm.cursor, max(0, len(self.current_events) - 1)))
+            self.resume.event_scroll = max(0, bm.scroll)
+            self.ensure_event_cursor_visible()
+        else:
+            self.resume.screen = "job"
+            self.resume.output_scroll = max(0, bm.scroll)
+        self.persist()
+        self.set_status(f"Jumped to bookmark {next_idx + 1}/{len(self.bookmarks)}")
+
+    def save_current_detail_to_file(self, detail: Dict[str, Any], fmt: str) -> None:
+        event_id = detail.get("id", "event")
+        job_id = self.resume.selected_job_id or "job"
+        filename = sanitize_filename(f"job_{job_id}_event_{event_id}.{fmt}")
+        path = Path.cwd() / filename
+        content = dump_data(detail, fmt)
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(content)
+        self.set_status(f"Saved {path}")
+
+
+    # ---------- Input helpers ----------
+
+    def prompt_input(self, prompt: str, initial: str = "") -> str:
+        h, w = self.stdscr.getmaxyx()
+        width = min(max(40, len(prompt) + 10), max(20, w - 4))
+        win = curses.newwin(3, width, max(0, h // 2 - 1), max(0, (w - width) // 2))
+        win.box()
+        try:
+            win.addstr(0, 2, " Input ")
+            display_prompt = prompt[: max(1, width - 4)]
+            win.addstr(1, 1, display_prompt[: width - 2])
+        except curses.error:
+            pass
+        edit_x = min(width - 2, len(display_prompt) + 2)
+        edit_w = max(5, width - edit_x - 1)
+        edit = curses.newwin(1, edit_w, max(0, h // 2), max(0, (w - width) // 2 + edit_x))
+        edit.addstr(0, 0, initial[: max(0, edit_w - 1)])
+        curses.curs_set(1)
+        box = curses.textpad.Textbox(edit)
+        try:
+            value = box.edit().strip()
+        finally:
+            curses.curs_set(0)
+        return value
+
+    def show_popup_text(self, title: str, text: str, allow_format_toggle: bool = False, detail: Optional[Dict[str, Any]] = None) -> PopupResult:
+        self.popup_active = True
+        scroll = 0
+        fmt = self.resume.detail_format
+        while True:
+            h, w = self.stdscr.getmaxyx()
+            ph = max(10, min(h - 4, int(h * 0.75)))
+            pw = max(40, min(w - 4, int(w * 0.8)))
+            py = max(0, (h - ph) // 2)
+            px = max(0, (w - pw) // 2)
+            win = curses.newwin(ph, pw, py, px)
+            win.keypad(True)
+            win.box()
+            title_text = f" {title} "
+            try:
+                win.addstr(0, 2, title_text[: max(1, pw - 4)], curses.A_BOLD)
+            except curses.error:
+                pass
+
+            if allow_format_toggle and detail is not None:
+                text = dump_data(detail, fmt)
+                self.resume.detail_format = fmt
+
+            lines = wrapped_lines(text, max(10, pw - 2))
+            body_h = ph - 3
+            max_scroll = max(0, len(lines) - body_h)
+            scroll = max(0, min(scroll, max_scroll))
+
+            for row in range(body_h):
+                idx = scroll + row
+                if idx >= len(lines):
+                    break
+                line = lines[idx]
+                try:
+                    win.addstr(1 + row, 1, line[: pw - 2])
+                except curses.error:
+                    pass
+
+            footer = "q/Esc close  Up/Down scroll  PgUp/PgDn fast"
+            if allow_format_toggle and detail is not None:
+                footer += "  y yaml  j json  s save"
+            try:
+                win.addstr(ph - 1, 2, footer[: max(1, pw - 4)])
+            except curses.error:
+                pass
+
+            win.refresh()
+            ch = win.getch()
+
+            if ch in (ord("q"), 27):
+                self.popup_active = False
+                self.persist()
+                return PopupResult(closed=True)
+            if ch == curses.KEY_UP:
+                scroll = max(0, scroll - 1)
+            elif ch == curses.KEY_DOWN:
+                scroll = min(max_scroll, scroll + 1)
+            elif ch == curses.KEY_PPAGE:
+                scroll = max(0, scroll - max(1, body_h - 1))
+            elif ch == curses.KEY_NPAGE:
+                scroll = min(max_scroll, scroll + max(1, body_h - 1))
+            elif allow_format_toggle and detail is not None and ch in (ord("j"), ord("J")):
+                fmt = "json"
+            elif allow_format_toggle and detail is not None and ch in (ord("y"), ord("Y")):
+                fmt = "yaml"
+            elif allow_format_toggle and detail is not None and ch == ord("s"):
+                self.save_current_detail_to_file(detail, fmt)
+
+    # ---------- Drawing ----------
+
+    def draw_status_bar(self) -> None:
+        h, w = self.stdscr.getmaxyx()
+        status = self.status_message if now_ts() - self.status_ts < 8 else ""
+        left = f" {APP_NAME} | {self.resume.screen} "
+        right = status
+        try:
+            self.stdscr.attron(curses.A_REVERSE)
+            self.stdscr.addstr(h - 1, 0, " " * max(0, w - 1))
+            self.stdscr.addstr(h - 1, 0, left[: max(0, w - 1)])
+            if right:
+                start = max(0, w - len(right) - 1)
+                self.stdscr.addstr(h - 1, start, right[: max(0, w - start - 1)])
+            self.stdscr.attroff(curses.A_REVERSE)
+        except curses.error:
+            pass
+
+    def draw_jobs(self) -> None:
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        results = self.jobs_page_data.get("results", []) or []
+        title = f" Jobs page {self.resume.jobs_page}  total={self.jobs_page_data.get('count', 0)} "
+        try:
+            self.stdscr.addstr(0, 0, title[: max(1, w - 1)], curses.A_BOLD)
+        except curses.error:
+            pass
+
+        rows = max(1, h - 2)
+        for i in range(min(len(results), rows - 1)):
+            job = results[i]
+            line = (
+                f"{'>' if i == self.resume.jobs_cursor else ' '} "
+                f"{str(job.get('id', '')):<7} "
+                f"{str(job.get('status', '')):<12} "
+                f"{str(job.get('name', '') or job.get('job_template', '')):<36.36} "
+                f"{str(job.get('finished', '') or ''):<22}"
+            )
+            attr = curses.A_REVERSE if i == self.resume.jobs_cursor else curses.A_NORMAL
+            try:
+                self.stdscr.addstr(1 + i, 0, line[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+
+        footer = "Enter open  PgUp/PgDn page  / search  n/N next/prev  h help  q quit"
+        try:
+            self.stdscr.addstr(h - 2, 0, footer[: max(1, w - 1)])
+        except curses.error:
+            pass
+        self.draw_status_bar()
+        self.stdscr.refresh()
+
+    def draw_job_output(self) -> None:
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        job_id = self.resume.selected_job_id or "?"
+        job_name = (self.current_job or {}).get("name") or (self.current_job or {}).get("job_template") or ""
+        title = f" Job {job_id} {job_name} "
+        try:
+            self.stdscr.addstr(0, 0, title[: max(1, w - 1)], curses.A_BOLD)
+        except curses.error:
+            pass
+
+        body_h = max(1, h - 2)
+        max_scroll = max(0, len(self.current_stdout_lines) - body_h)
+        self.resume.output_scroll = max(0, min(self.resume.output_scroll, max_scroll))
+
+        for row in range(body_h - 1):
+            idx = self.resume.output_scroll + row
+            if idx >= len(self.current_stdout_lines):
+                break
+            line = self.current_stdout_lines[idx]
+            attr = curses.A_NORMAL
+            term = self.resume.output_search.strip().lower()
+            if term and term in line.lower():
+                attr = curses.A_BOLD
+            try:
+                self.stdscr.addstr(1 + row, 0, line[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+
+        footer = "q back  g/G top/bottom  / search  n/N next/prev  t tasks  b bookmark  j jump"
+        try:
+            self.stdscr.addstr(h - 2, 0, footer[: max(1, w - 1)])
+        except curses.error:
+            pass
+        self.draw_status_bar()
+        self.stdscr.refresh()
+
+    def draw_events(self) -> None:
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        job_id = self.resume.selected_job_id or "?"
+        title = f" Job {job_id} Events ({len(self.current_events)}) "
+        try:
+            self.stdscr.addstr(0, 0, title[: max(1, w - 1)], curses.A_BOLD)
+        except curses.error:
+            pass
+
+        body_h = max(1, h - 2)
+        self.ensure_event_cursor_visible()
+        for row in range(body_h - 1):
+            idx = self.resume.event_scroll + row
+            if idx >= len(self.current_events):
+                break
+            event = self.current_events[idx]
+            marker = ">" if idx == self.resume.event_cursor else " "
+            line = (
+                f"{marker} "
+                f"{str(event.get('id', '')):<7} "
+                f"{str(event.get('event_display', event.get('event', ''))):<18.18} "
+                f"{str(event.get('host_name', '')):<18.18} "
+                f"{str(event.get('task', '')):<34.34} "
+                f"{str(event.get('start_line', '')):>6}"
+            )
+            attr = curses.A_REVERSE if idx == self.resume.event_cursor else curses.A_NORMAL
+            try:
+                self.stdscr.addstr(1 + row, 0, line[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+
+        footer = "q back  Enter YAML  J JSON  / search  n/N  s save  b bookmark  j jump"
+        try:
+            self.stdscr.addstr(h - 2, 0, footer[: max(1, w - 1)])
+        except curses.error:
+            pass
+        self.draw_status_bar()
+        self.stdscr.refresh()
+
+    # ---------- Actions ----------
+
+    def open_selected_job(self) -> None:
+        job = self.selected_job_from_list()
+        if not job:
+            self.set_status("No job selected")
+            return
+        job_id = int(job["id"])
+        self.load_job(job_id)
+        self.load_stdout()
+        self.resume.screen = "job"
+        self.persist()
+
+    def open_selected_event_detail(self, fmt: str = "yaml") -> None:
+        event = self.selected_event()
+        if not event:
+            self.set_status("No event selected")
+            return
+        event_id = int(event["id"])
+        detail = self.get_event_detail(event_id)
+        self.resume.detail_format = fmt
+        text = dump_data(detail, fmt)
+        self.show_popup_text(f" Event {event_id} detail ", text, allow_format_toggle=True, detail=detail)
+
+    def refresh_current_view(self) -> None:
+        if self.resume.screen == "jobs":
+            self.load_jobs_page(force=True)
+            self.set_status("Refreshed jobs")
+        elif self.resume.screen == "job":
+            if self.resume.selected_job_id is not None:
+                self.load_job(self.resume.selected_job_id, force=True)
+                self.load_stdout(force=True)
+                self.set_status("Refreshed job output")
+        elif self.resume.screen == "events":
+            if self.resume.selected_job_id is not None:
+                self.load_events(force=True)
+                self.set_status("Refreshed job events")
+        self.persist()
+
+    # ---------- Event loop ----------
+
+    def bootstrap(self) -> None:
+        self.load_jobs_page()
+        if self.resume.selected_job_id is not None and self.resume.screen in {"job", "events"}:
+            try:
+                self.load_job(self.resume.selected_job_id)
+                self.load_stdout()
+                if self.resume.screen == "events":
+                    self.load_events()
+            except Exception as exc:
+                self.set_status(str(exc))
+                self.resume.screen = "jobs"
+        self.persist()
+
+    def run(self) -> None:
+        self.bootstrap()
+        while True:
+            self._rebuild_stdout_lines_if_needed()
+            if self.resume.screen == "jobs":
+                self.draw_jobs()
+                ch = self.stdscr.getch()
+                if self.handle_jobs_input(ch):
+                    break
+            elif self.resume.screen == "job":
+                self.draw_job_output()
+                ch = self.stdscr.getch()
+                if self.handle_job_output_input(ch):
+                    break
+            elif self.resume.screen == "events":
+                self.draw_events()
+                ch = self.stdscr.getch()
+                if self.handle_events_input(ch):
+                    break
+            else:
+                self.resume.screen = "jobs"
+
+    def _rebuild_stdout_lines_if_needed(self) -> None:
+        if self.resume.screen == "job":
+            self._rebuild_stdout_lines()
+
+    def handle_common_keys(self, ch: int) -> bool:
+        if ch in (ord("h"), ord("?")):
+            self.show_popup_text(" Help ", HELP_TEXT)
+            return False
+        if ch == ord("r"):
+            try:
+                self.refresh_current_view()
+            except Exception as exc:
+                self.set_status(str(exc))
+            return False
+        return False
+
+    def handle_jobs_input(self, ch: int) -> bool:
+        if self.handle_common_keys(ch):
+            return True
+        results = self.jobs_page_data.get("results", []) or []
+        if ch == ord("q"):
+            return True
+        if ch == curses.KEY_UP:
+            self.resume.jobs_cursor = max(0, self.resume.jobs_cursor - 1)
+        elif ch == curses.KEY_DOWN:
+            self.resume.jobs_cursor = min(max(0, len(results) - 1), self.resume.jobs_cursor + 1)
+        elif ch == curses.KEY_PPAGE:
+            self.resume.jobs_page = max(1, self.resume.jobs_page - 1)
+            self.resume.jobs_cursor = 0
+            try:
+                self.load_jobs_page()
+            except Exception as exc:
+                self.set_status(str(exc))
+        elif ch == curses.KEY_NPAGE:
+            next_url = self.jobs_page_data.get("next")
+            if next_url or results:
+                self.resume.jobs_page += 1
+                self.resume.jobs_cursor = 0
+                try:
+                    self.load_jobs_page()
+                except Exception as exc:
+                    self.resume.jobs_page = max(1, self.resume.jobs_page - 1)
+                    self.set_status(str(exc))
+        elif ch in (10, 13, curses.KEY_ENTER):
+            try:
+                self.open_selected_job()
+            except Exception as exc:
+                self.set_status(str(exc))
+        elif ch == ord("/"):
+            term = self.prompt_input("Job search: ", self.jobs_search_term)
+            self.jobs_search_term = term
+            self.resume.jobs_page = 1
+            self.resume.jobs_cursor = 0
+            try:
+                self.load_jobs_page(force=True)
+            except Exception as exc:
+                self.set_status(str(exc))
+        elif ch == ord("n"):
+            self.goto_next_job_match(reverse=False)
+        elif ch == ord("N"):
+            self.goto_next_job_match(reverse=True)
+
+        self.persist()
+        return False
+
+    def handle_job_output_input(self, ch: int) -> bool:
+        if self.handle_common_keys(ch):
+            return True
+        h, _ = self.stdscr.getmaxyx()
+        stride = max(1, h - 3)
+        if ch == ord("q"):
+            self.resume.screen = "jobs"
+            return False
+        if ch == curses.KEY_UP:
+            self.resume.output_scroll = max(0, self.resume.output_scroll - 1)
+        elif ch == curses.KEY_DOWN:
+            self.resume.output_scroll = min(max(0, len(self.current_stdout_lines) - stride), self.resume.output_scroll + 1)
+        elif ch == curses.KEY_PPAGE:
+            self.resume.output_scroll = max(0, self.resume.output_scroll - stride)
+        elif ch == curses.KEY_NPAGE:
+            self.resume.output_scroll = min(max(0, len(self.current_stdout_lines) - stride), self.resume.output_scroll + stride)
+        elif ch == ord("g"):
+            self.resume.output_scroll = 0
+        elif ch == ord("G"):
+            self.resume.output_scroll = max(0, len(self.current_stdout_lines) - stride)
+        elif ch == ord("/"):
+            term = self.prompt_input("Output search: ", self.resume.output_search)
+            self.resume.output_search = term
+            self.build_output_search()
+            if self.output_search_matches:
+                self.resume.output_scroll = self.output_search_matches[0]
+            else:
+                self.set_status("No output matches")
+        elif ch == ord("n"):
+            self.goto_next_output_match(reverse=False)
+        elif ch == ord("N"):
+            self.goto_next_output_match(reverse=True)
+        elif ch == ord("t"):
+            try:
+                self.load_events()
+                self.resume.screen = "events"
+            except Exception as exc:
+                self.set_status(str(exc))
+        elif ch == ord("b"):
+            self.add_bookmark()
+        elif ch == ord("j"):
+            try:
+                self.jump_bookmark()
+            except Exception as exc:
+                self.set_status(str(exc))
+        self.persist()
+        return False
+
+    def handle_events_input(self, ch: int) -> bool:
+        if self.handle_common_keys(ch):
+            return True
+        h, _ = self.stdscr.getmaxyx()
+        stride = max(1, h - 3)
+        if ch == ord("q"):
+            self.resume.screen = "job"
+            return False
+        if ch == curses.KEY_UP:
+            self.resume.event_cursor = max(0, self.resume.event_cursor - 1)
+            self.ensure_event_cursor_visible()
+        elif ch == curses.KEY_DOWN:
+            self.resume.event_cursor = min(max(0, len(self.current_events) - 1), self.resume.event_cursor + 1)
+            self.ensure_event_cursor_visible()
+        elif ch == curses.KEY_PPAGE:
+            self.resume.event_cursor = max(0, self.resume.event_cursor - stride)
+            self.ensure_event_cursor_visible()
+        elif ch == curses.KEY_NPAGE:
+            self.resume.event_cursor = min(max(0, len(self.current_events) - 1), self.resume.event_cursor + stride)
+            self.ensure_event_cursor_visible()
+        elif ch == ord("/"):
+            term = self.prompt_input("Event search: ", self.resume.event_search)
+            self.resume.event_search = term
+            self.build_event_search()
+            if not self.event_search_matches:
+                self.set_status("No event matches")
+        elif ch == ord("n"):
+            self.goto_next_event_match(reverse=False)
+        elif ch == ord("N"):
+            self.goto_next_event_match(reverse=True)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            try:
+                self.open_selected_event_detail(fmt="yaml")
+            except Exception as exc:
+                self.set_status(str(exc))
+        elif ch == ord("J"):
+            try:
+                self.open_selected_event_detail(fmt="json")
+            except Exception as exc:
+                self.set_status(str(exc))
+        elif ch == ord("s"):
+            event = self.selected_event()
+            if event:
+                try:
+                    detail = self.get_event_detail(int(event["id"]))
+                    self.save_current_detail_to_file(detail, self.resume.detail_format)
+                except Exception as exc:
+                    self.set_status(str(exc))
+        elif ch == ord("b"):
+            self.add_bookmark()
+        elif ch == ord("j"):
+            try:
+                self.jump_bookmark()
+            except Exception as exc:
+                self.set_status(str(exc))
+        self.persist()
+        return False
+
+# --------------------------- Main ---------------------------
+
+
+def init_curses(stdscr: Any) -> None:
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    curses.use_default_colors()
+
+
+def app_main(stdscr: Any) -> None:
+    init_curses(stdscr)
+    cfg = AppConfig.load()
+    if not cfg.host:
+        raise RuntimeError(
+            f"No host configured. Set AAP_HOST or write {CONFIG_FILE} with host/token."
+        )
+    store = LocalStore()
+    client = AAPClient(cfg)
+    app = CursesApp(stdscr, client, store, cfg)
+    app.run()
+
+
+def main() -> int:
+    try:
+        curses.wrapper(app_main)
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+  
